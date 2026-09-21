@@ -1,7 +1,10 @@
 import math
 from datetime import datetime, timezone
 
-from app.services.tides import compute_navigation_windows
+from app.services.tides import (
+    _clip_merge_blocks,
+    compute_navigation_windows,
+)
 
 
 def dt(hours: float) -> datetime:
@@ -118,3 +121,128 @@ def test_crossing_rounded_to_seconds():
         t0.timestamp() + 101, tz=timezone.utc
     )
     assert res.windows[0].end == times[1]
+
+
+def _plateau_payload(**kwargs):
+    # Safe plateau 00:00..10:00 (height 9, threshold 5) with a 2-hour
+    # forbidden gap between 04:00 and 06:00.
+    times = [
+        dt(h) for h in (0, 1, 2, 3, 4, 6, 7, 8, 9, 10)
+    ]
+    return compute_navigation_windows(
+        sample_times=times,
+        sample_heights=[9.0] * 10,
+        query_start=dt(0),
+        query_end=dt(10),
+        draft_m=5.0,
+        clearance_m=0.0,
+        max_gap_seconds=3600 + 1,
+        **kwargs,
+    )
+
+
+def test_departure_without_new_fields_is_empty():
+    res = _plateau_payload()
+    assert res.departure_windows == []
+
+
+def test_departure_windows_fit_inside_safe_windows_and_never_cross_unknown():
+    # One-hour transit: viable departures are [00:00, 03:00:01) on the
+    # closed safe window [00:00, 04:00] (departing at 03:00 occupies
+    # [03:00, 04:00), which reaches but does not pass the closed end) and
+    # [06:00, 09:00:01) on [06:00, 10:00].
+    res = _plateau_payload(transit_duration_seconds=3600)
+    assert [
+        (d.start, d.end) for d in res.departure_windows
+    ] == [
+        (dt(0), datetime.fromtimestamp(3 * 3600 + 1, tz=timezone.utc)),
+        (dt(6), datetime.fromtimestamp(9 * 3600 + 1, tz=timezone.utc)),
+    ]
+    # End is half-open: last viable departure is one second before it.
+    first = res.departure_windows[0]
+    assert first.duration_seconds == 3 * 3600 + 1
+    assert (first.end - first.start).total_seconds() == first.duration_seconds
+    # No departure window bridges the 04:00..06:00 unknown stretch.
+    assert all(d.end <= datetime.fromtimestamp(4 * 3600 + 1, tz=timezone.utc)
+               or d.start >= dt(6)
+               for d in res.departure_windows)
+
+
+def test_departure_windows_blocked_by_shifted_maintenance():
+    # Closure 02:00..02:30 shifted earlier by one hour forbids
+    # departures in [01:00, 01:30), splitting the first candidate run.
+    res = _plateau_payload(
+        transit_duration_seconds=3600,
+        maintenance_blocks=[(dt(2), dt(2.5))],
+    )
+    assert [
+        (d.start, d.end) for d in res.departure_windows
+    ] == [
+        (dt(0), dt(1)),
+        (dt(1.5), datetime.fromtimestamp(3 * 3600 + 1, tz=timezone.utc)),
+        (dt(6), datetime.fromtimestamp(9 * 3600 + 1, tz=timezone.utc)),
+    ]
+
+
+def test_departure_maintenance_half_open_boundary_endpoint_allowed():
+    # Occupancy [d, d+D) and closures are half-open.  Closure [01:00,02:00)
+    # shifted earlier by one hour forbids departures in [00:00, 01:00):
+    # departing at 01:00 (occupancy [02:00,03:00)) does not intersect it.
+    res = _plateau_payload(
+        transit_duration_seconds=3600,
+        maintenance_blocks=[(dt(1), dt(2))],
+    )
+    first = res.departure_windows[0]
+    assert first.start == dt(1) and first.end == datetime.fromtimestamp(
+        3 * 3600 + 1, tz=timezone.utc
+    )
+    # Departure second 00:00 is removed and the run starts exactly at 01:00.
+    assert all(d.start != dt(0) for d in res.departure_windows)
+
+
+def test_departure_longer_than_window_yields_nothing():
+    res = _plateau_payload(transit_duration_seconds=5 * 3600)
+    assert res.departure_windows == []
+
+
+def test_departure_zero_duration_returns_safe_windows_half_open():
+    res = _plateau_payload(transit_duration_seconds=0.0)
+    # Safe windows [00:00,04:00] and [06:00,10:00] become half-open
+    # departure intervals [start, end+1s).
+    assert [
+        (d.start, d.end) for d in res.departure_windows
+    ] == [
+        (dt(0), datetime.fromtimestamp(4 * 3600 + 1, tz=timezone.utc)),
+        (dt(6), datetime.fromtimestamp(10 * 3600 + 1, tz=timezone.utc)),
+    ]
+
+
+def test_maintenance_blocks_clipped_merged_and_sorted():
+    blocks = _clip_merge_blocks(
+        [
+            (20.0, 30.0),
+            (10.0, 20.0),   # abuts the previous one
+            (15.0, 25.0),   # overlaps both
+            (40.0, 50.0),
+            (-10.0, 5.0),   # clipped to the query start
+            (95.0, 120.0),  # clipped to the query end
+            (200.0, 300.0),  # entirely outside -> dropped
+            (50.0, 50.0),   # empty -> dropped
+        ],
+        0.0,
+        100.0,
+    )
+    assert blocks == [(0.0, 5.0), (10.0, 30.0), (40.0, 50.0), (95.0, 100.0)]
+
+
+def test_departure_blocks_outside_query_are_ignored():
+    res = _plateau_payload(
+        transit_duration_seconds=3600,
+        maintenance_blocks=[(dt(20), dt(22))],
+    )
+    assert [
+        (d.start, d.end) for d in res.departure_windows
+    ] == [
+        (dt(0), datetime.fromtimestamp(3 * 3600 + 1, tz=timezone.utc)),
+        (dt(6), datetime.fromtimestamp(9 * 3600 + 1, tz=timezone.utc)),
+    ]

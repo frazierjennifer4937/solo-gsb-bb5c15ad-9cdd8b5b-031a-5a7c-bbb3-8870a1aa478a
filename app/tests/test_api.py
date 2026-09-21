@@ -1,5 +1,6 @@
 import os
 import tempfile
+from datetime import datetime
 
 import pytest
 
@@ -84,6 +85,87 @@ def test_gap_returns_unknown(client):
     assert len(result["windows"]) == 2
     reasons = {u["reason"] for u in result["unknown"]}
     assert "sample_gap_exceeds_max_gap" in reasons
+
+
+def test_result_has_empty_departure_windows_without_new_fields(client):
+    resp = client.post("/tasks", json=_payload())
+    result = client.get(f"/tasks/{resp.json()['task_id']}").json()["result"]
+    # Legacy behaviour is preserved: the field exists but is empty.
+    assert result["departure_windows"] == []
+    # Original outputs are unchanged.
+    assert len(result["windows"]) == 1
+    assert result["unknown"] == []
+
+
+def test_transit_duration_returns_departure_windows(client):
+    payload = _payload()
+    payload["transit_duration_seconds"] = 3600
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 201, resp.text
+    body = client.get(f"/tasks/{resp.json()['task_id']}").json()
+    assert body["request"]["transit_duration_seconds"] == 3600.0
+    result = body["result"]
+    assert len(result["departure_windows"]) == 1
+    dep = result["departure_windows"][0]
+    win = result["windows"][0]
+    # The whole occupancy must fit inside the safe window.
+    assert dep["start"] >= win["start"]
+    assert dep["duration_seconds"] > 0
+    # Half-open end: end - start == duration_seconds.
+    def parse(s):
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+    assert (
+        parse(dep["end"]) - parse(dep["start"])
+    ).total_seconds() == dep["duration_seconds"]
+    # Last possible departure (one second before end) must still fit.
+    assert parse(dep["end"]).timestamp() - 1 + 3600 <= parse(win["end"]).timestamp()
+
+
+def test_maintenance_blocks_shifted_and_subtracted(client):
+    payload = _payload()
+    payload["transit_duration_seconds"] = 3600
+    # Two abutting blocks merge into 04:30..05:30; the third extends past
+    # query_end and is clipped to ..07:00 (it does not affect this window).
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T04:30:00Z", "end": "2026-09-21T05:00:00Z"},
+        {"start": "2026-09-21T05:00:00Z", "end": "2026-09-21T05:30:00Z"},
+        {"start": "2026-09-21T06:30:00Z", "end": "2026-09-21T09:00:00Z"},
+    ]
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 201, resp.text
+    result = client.get(f"/tasks/{resp.json()['task_id']}").json()["result"]
+    deps = result["departure_windows"]
+    assert len(deps) == 1
+    # Safe window 01:39:11..05:20:49 with D=3600; the merged closure
+    # 04:30..05:30 shifted earlier by one hour forbids [03:30, 04:30).
+    assert deps[0]["start"] == "2026-09-21T01:39:11Z"
+    assert deps[0]["end"] == "2026-09-21T03:30:00Z"
+    assert deps[0]["duration_seconds"] == 6649
+    # Half-open semantics: 03:30:00 is the last viable second.
+    assert deps[0]["end"] > deps[0]["start"]
+
+
+def test_maintenance_without_duration_is_ignored(client):
+    payload = _payload()
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T02:00:00Z", "end": "2026-09-21T03:00:00Z"}
+    ]
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 201, resp.text
+    result = client.get(f"/tasks/{resp.json()['task_id']}").json()["result"]
+    assert result["departure_windows"] == []
+
+
+def test_validation_rejects_bad_maintenance_block(client):
+    payload = _payload()
+    payload["transit_duration_seconds"] = 3600
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T02:00:00Z"}
+    ]
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 422
+    assert "maintenance_blocks" in resp.text
 
 
 def test_health(client):

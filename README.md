@@ -5,6 +5,13 @@
 求根并**保守取整到秒**。相邻样本间隔超过 `max_gap_seconds` 的区段**禁止插值**，
 作为 `unknown` 返回，通航窗口不会跨越该区段。
 
+创建任务时还可传入 `transit_duration_seconds`（全程航程占用时长）与
+`maintenance_blocks`（维护封航区间，UTC 起止）。传入航程时长后，结果新增
+`departure_windows`：仅返回**出发时刻 `d` 的占用区间 `[d, d+航程时长)` 全程落在
+同一个安全通航窗口内**（因而绝不跨越 `unknown`）、**且不与任何封航区间相交**的出发
+时段。封航区间会先裁剪到查询范围并合并重叠/首尾相接区间，再整体向过去平移一个航程
+时长后，从候选出发区间中扣除。
+
 计算以**异步任务**方式执行：先创建任务拿到 ID，再按 ID 轮询结果；任务状态与
 结果持久化在 SQLite 中（容器启动时自动建库建表）。
 
@@ -61,9 +68,15 @@ TIDE_DB_PATH=./data/tide.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `draft_m` | number ≥ 0 | 船舶吃水（米） |
 | `clearance_m` | number ≥ 0 | 船底最小富余水深（米） |
 | `max_gap_seconds` | number > 0 | 相邻样本最大允许间隔（秒），超过则该区段禁止插值 |
+| `transit_duration_seconds` | number ≥ 0，可选 | 全程航程占用时长（秒）。传入后结果含 `departure_windows`；不传则保持原行为（该字段返回空数组） |
+| `maintenance_blocks` | 数组，可选 | 维护封航区间 `[{"start", "end"}]`（UTC 起止）。自动裁剪到查询范围，并合并重叠或**首尾相接**区间；仅在传入航程时长时生效 |
 
 > 潮高、吃水、富余必须使用**同一垂直基准面**，单位统一为米。
 > 安全水深阈值 = `draft_m + clearance_m`。
+>
+> 航程占用按**半开区间** `[departure, departure + transit_duration_seconds)` 处理；
+> 封航区间同为半开 `[start, end)`，占用区间与封航区间仅在端点相切时不算相交。
+> 出发时刻与窗口边界均保守取整到整秒。
 
 ```bash
 curl -X POST http://localhost:8000/tasks \
@@ -83,9 +96,18 @@ curl -X POST http://localhost:8000/tasks \
     "query_end":   "2026-09-21T07:00:00Z",
     "draft_m": 4.0,
     "clearance_m": 1.0,
-    "max_gap_seconds": 3700
+    "max_gap_seconds": 3700,
+    "transit_duration_seconds": 3600,
+    "maintenance_blocks": [
+      {"start": "2026-09-21T04:30:00Z", "end": "2026-09-21T05:00:00Z"},
+      {"start": "2026-09-21T05:00:00Z", "end": "2026-09-21T05:30:00Z"},
+      {"start": "2026-09-21T06:30:00Z", "end": "2026-09-21T09:00:00Z"}
+    ]
   }'
 ```
+
+上例中前两段封航首尾相接，合并为 `04:30–05:30`；第三段超出查询范围，裁剪为
+`06:30–07:00`（平移后不影响本窗口内的候选出发）。
 
 ### 2. 按 ID 查询任务
 
@@ -109,7 +131,17 @@ curl -X POST http://localhost:8000/tasks \
 | `sample_gap_exceeds_max_gap` | 相邻样本间隔超过 `max_gap_seconds`，按要求禁止插值 |
 | `no_sample_coverage` | 查询范围超出全部样本覆盖区间（不做外推） |
 
-示例响应（节选）：
+`result.departure_windows[]`（**仅当传入 `transit_duration_seconds` 时非空**；
+否则为 `[]`，原 `windows` / `unknown` 行为不变）。每个时段为半开区间
+`[start, end)`，整秒，UTC `Z` 结尾：
+
+| 字段 | 说明 |
+| --- | --- |
+| `start` | 最早可行出发时刻 |
+| `end` | 出发时段右端点（**半开**：该时刻本身不可出发，最后一个可行出发为 `end - 1s`） |
+| `duration_seconds` | 可行出发秒数（`end - start`） |
+
+示例响应（对应上文请求，节选）：
 
 ```json
 {
@@ -117,23 +149,39 @@ curl -X POST http://localhost:8000/tasks \
   "status": "done",
   "created_at": "2026-09-21T05:16:13.811445Z",
   "result": {
-    "threshold_m": 4.5,
+    "threshold_m": 5.0,
     "max_gap_seconds": 3700.0,
     "windows": [
       {
-        "start": "2026-09-21T01:33:22Z",
-        "end": "2026-09-21T04:26:38Z",
-        "start_height_m": 4.5,
-        "end_height_m": 4.5,
-        "min_height_m": 4.5,
-        "duration_seconds": 10396
+        "start": "2026-09-21T01:39:11Z",
+        "end": "2026-09-21T05:20:49Z",
+        "start_height_m": 5.001,
+        "end_height_m": 5.001,
+        "min_height_m": 5.001,
+        "duration_seconds": 13298
       }
     ],
-    "unknown": []
+    "unknown": [],
+    "departure_windows": [
+      {
+        "start": "2026-09-21T01:39:11Z",
+        "end": "2026-09-21T03:30:00Z",
+        "duration_seconds": 6649
+      }
+    ]
   },
   "error": null
 }
 ```
+
+示例解读：安全窗口为 `01:39:11–05:20:49`（闭区间，端点整秒安全）。航程 1 小时，
+故候选出发时段为 `01:39:11–04:20:49`（即 `04:20:49` 出发时占用区间
+`[04:20:49, 05:20:49)` 恰好结束在安全窗口右端点）。封航段 `04:30–05:30` 向过去
+平移 1 小时得到禁出发段 `03:30–04:30`，从候选中扣除后只剩
+`01:39:11–03:30:00`（半开）：`03:30:00` 出发时占用区间为 `[03:30,04:30)`，与
+封航段在 `04:30` 端点相切，按半开区间约定不算相交，故 `03:30:00` 为最后一个可行
+出发；`03:30:01` 起占用区间即与封航段相交。另一段 `06:30–07:00` 平移为
+`05:30–06:00`，完全落在候选之外，不影响结果。
 
 校验失败（如样本未严格递增、吃水为负等）统一返回 `422` 并指明字段与原因。
 
@@ -154,6 +202,12 @@ curl -X POST http://localhost:8000/tasks \
 6. **unknown 互补集**：查询区间内未被任何有效链覆盖的部分即为 `unknown`，
    并区分“超间隔（禁止插值）”与“无样本覆盖（不外推）”两种原因；
    窗口严格落在覆盖区内，绝不跨越未知段。
+7. **航程占用与出发时段**（传入 `transit_duration_seconds` 时）：对每个安全窗口
+   `[ws, we]`，候选出发时刻满足 `[d, d+D) ⊆ [ws, we]`（`D` 为航程时长），
+   保守取整到整秒；由于安全窗口本身不跨越 `unknown`，候选出发也绝不跨越未知段。
+   维护封航区间先裁剪到查询范围、合并重叠或首尾相接区间，再将每段 `[a, b)`
+   整体向过去平移 `D` 得到禁出发段 `[a-D, b-D)`，从候选中逐段扣除；
+   占用与封航均为半开区间，仅端点相切不视为相交。
 
 ## 项目结构与测试
 
@@ -163,7 +217,7 @@ app/
   schemas.py         # 请求/响应模型与输入校验
   config.py          # 配置（TIDE_DB_PATH 等）
   db.py              # SQLite 连接与启动建表
-  services/tides.py  # PCHIP 插值、求根、窗口与 unknown 计算
+  services/tides.py  # PCHIP 插值、求根、窗口与 unknown 计算、航程占用/封航扣除
   tests/             # pytest：算法单测 + 接口端到端测试
 Dockerfile           # 依赖安装于构建阶段
 docker-compose.yml   # 一条命令启动，含卷持久化与健康检查

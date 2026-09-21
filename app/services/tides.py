@@ -45,6 +45,21 @@ class Window:
 
 
 @dataclass(frozen=True)
+class DepartureWindow:
+    """Half-open interval ``[start, end)`` of viable departure instants.
+
+    A departure at integer second ``d`` is viable when the whole occupancy
+    ``[d, d + transit_duration_seconds)`` stays inside one safe window
+    (hence never crosses an ``unknown`` stretch) and does not intersect any
+    maintenance closure.  ``duration_seconds`` counts the viable seconds.
+    """
+
+    start: datetime
+    end: datetime
+    duration_seconds: int
+
+
+@dataclass(frozen=True)
 class UnknownInterval:
     """Part of the query range where no answer can be given."""
 
@@ -60,6 +75,7 @@ class NavigationResult:
     max_gap_seconds: float
     windows: list[Window]
     unknown: list[UnknownInterval]
+    departure_windows: list[DepartureWindow]
 
 
 def to_epoch(t: datetime) -> float:
@@ -239,6 +255,98 @@ def _classify_unknown(
                         "no_sample_coverage")
 
 
+def _clip_merge_blocks(
+    blocks: Sequence[tuple[float, float]], query_start: float, query_end: float
+) -> list[tuple[float, float]]:
+    """Clip closure blocks to the query range and merge overlaps/touches.
+
+    Returns a chronologically sorted list of half-open intervals
+    ``[lo, hi)``.  Blocks that do not intersect the query range are dropped
+    (an endpoint-only touch, ``lo == hi`` after clipping, is empty).
+    """
+    clipped = sorted(
+        (max(lo, query_start), min(hi, query_end))
+        for lo, hi in blocks
+        if min(hi, query_end) > max(lo, query_start)
+    )
+    merged: list[tuple[float, float]] = []
+    for lo, hi in clipped:
+        if merged and lo <= merged[-1][1]:
+            # Overlap (strict) or abut (equal ends) -> fuse the two pieces.
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def compute_departure_windows(
+    safe_windows: Sequence[Window],
+    transit_duration_seconds: float,
+    maintenance_blocks: Sequence[tuple[float, float]],
+    query_start: float,
+    query_end: float,
+) -> list[DepartureWindow]:
+    """Derive viable integer-second departure intervals.
+
+    For a departure at second ``d`` the vessel occupies ``[d, d + D)`` with
+    ``D = transit_duration_seconds``.  It is viable iff that whole half-open
+    interval lies inside one safe window (which already never spans an
+    ``unknown`` stretch) and does not intersect any maintenance closure.
+
+    The candidate set inside a safe window ``[ws, we]`` is therefore
+    ``[ws, we - D]`` (rounded conservatively to whole seconds).  Each
+    closure ``[a, b)`` is translated earlier by ``D`` and the resulting
+    half-open interval ``[a - D, b - D)`` is subtracted from every
+    candidate (as specified: only endpoint contact with a closure is
+    permitted by the half-open semantics).
+    """
+    duration = float(transit_duration_seconds)
+    closures = _clip_merge_blocks(maintenance_blocks, query_start, query_end)
+
+    out: list[DepartureWindow] = []
+    for win in safe_windows:
+        ws = to_epoch(win.start)
+        we = to_epoch(win.end)
+        # Conservative rounding to whole seconds: ceil the first and floor
+        # the last viable departure so every reported second is guaranteed
+        # safe.  Pieces are tracked half-open: [lo, hi).
+        cand_lo = math.ceil(ws)
+        cand_hi = math.floor(we - duration)
+        if cand_hi < cand_lo:
+            continue
+
+        pieces: list[tuple[int, int]] = [(cand_lo, cand_hi + 1)]
+        for a, b in closures:
+            # Translate the half-open closure [a, b) earlier by D: integer
+            # departures d with a - D <= d < b - D are forbidden.  The first
+            # such second is ceil(a - D) and the last is ceil(b - D) - 1.
+            bad_lo = math.ceil(a - duration)
+            bad_hi = math.ceil(b - duration) - 1  # last forbidden second
+            remaining: list[tuple[int, int]] = []
+            for lo, hi in pieces:
+                if bad_hi < lo or bad_lo > hi - 1:
+                    remaining.append((lo, hi))
+                    continue
+                if bad_lo > lo:
+                    remaining.append((lo, min(hi, bad_lo)))
+                if bad_hi + 1 < hi:
+                    remaining.append((max(lo, bad_hi + 1), hi))
+            pieces = remaining
+            if not pieces:
+                break
+
+        for lo, hi in pieces:
+            if hi > lo:
+                out.append(
+                    DepartureWindow(
+                        start=to_datetime(lo),
+                        end=to_datetime(hi),
+                        duration_seconds=int(hi - lo),
+                    )
+                )
+    return out
+
+
 def compute_navigation_windows(
     sample_times: Sequence[datetime],
     sample_heights: Sequence[float],
@@ -247,6 +355,8 @@ def compute_navigation_windows(
     draft_m: float,
     clearance_m: float,
     max_gap_seconds: float,
+    transit_duration_seconds: float | None = None,
+    maintenance_blocks: Sequence[tuple[datetime, datetime]] | None = None,
 ) -> NavigationResult:
     """Compute all continuous safe navigation windows in the query range.
 
@@ -308,9 +418,25 @@ def compute_navigation_windows(
     if cursor < qe:
         _classify_unknown(unknown, cursor, qe, first_time, last_time)
 
+    departure_windows: list[DepartureWindow] = []
+    if transit_duration_seconds is not None:
+        blocks = (
+            [(to_epoch(start), to_epoch(end)) for start, end in maintenance_blocks]
+            if maintenance_blocks
+            else []
+        )
+        departure_windows = compute_departure_windows(
+            safe_windows=windows,
+            transit_duration_seconds=transit_duration_seconds,
+            maintenance_blocks=blocks,
+            query_start=qs,
+            query_end=qe,
+        )
+
     return NavigationResult(
         threshold_m=threshold,
         max_gap_seconds=float(max_gap_seconds),
         windows=windows,
         unknown=unknown,
+        departure_windows=departure_windows,
     )
