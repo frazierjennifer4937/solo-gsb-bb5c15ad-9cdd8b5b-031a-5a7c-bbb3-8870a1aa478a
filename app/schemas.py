@@ -40,6 +40,21 @@ class TideSample(BaseModel):
     })
 
 
+class MaintenanceBlock(BaseModel):
+    start: datetime = Field(..., description="封航起始时间（UTC，无时区按 UTC 处理）")
+    end: datetime = Field(..., description="封航结束时间（UTC，须晚于起始时间）")
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+    })
+
+    @model_validator(mode="after")
+    def _validate(self) -> "MaintenanceBlock":
+        if to_epoch(self.end) <= to_epoch(self.start):
+            raise ValueError("maintenance_blocks 的 end 必须晚于 start")
+        return self
+
+
 class WindowRequest(BaseModel):
     samples: list[TideSample] = Field(..., min_length=2, description="按 UTC 递增的潮位样本")
     query_start: datetime = Field(..., description="查询起始时间（UTC）")
@@ -49,6 +64,38 @@ class WindowRequest(BaseModel):
     max_gap_seconds: float = Field(
         ..., gt=0, description="相邻样本最大允许间隔（秒），超过则禁止插值"
     )
+    transit_duration_seconds: float | None = Field(
+        None, gt=0,
+        description="航程占用时长（秒）；提供后结果附带 departure_windows",
+    )
+    maintenance_blocks: list[MaintenanceBlock] | None = Field(
+        None,
+        description="维护封航区间（UTC 起止）；裁剪到查询范围并合并重叠/首尾相接区间",
+    )
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "samples": [
+                {"time": "2026-09-21T00:00:00Z", "height_m": 1.0},
+                {"time": "2026-09-21T01:00:00Z", "height_m": 3.0},
+                {"time": "2026-09-21T02:00:00Z", "height_m": 6.0},
+                {"time": "2026-09-21T03:00:00Z", "height_m": 8.0},
+                {"time": "2026-09-21T04:00:00Z", "height_m": 8.0},
+                {"time": "2026-09-21T05:00:00Z", "height_m": 6.0},
+                {"time": "2026-09-21T06:00:00Z", "height_m": 3.0},
+                {"time": "2026-09-21T07:00:00Z", "height_m": 1.0},
+            ],
+            "query_start": "2026-09-21T00:00:00Z",
+            "query_end": "2026-09-21T07:00:00Z",
+            "draft_m": 4.0,
+            "clearance_m": 1.0,
+            "max_gap_seconds": 3700,
+            "transit_duration_seconds": 1800,
+            "maintenance_blocks": [
+                {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+            ],
+        }
+    })
 
     @model_validator(mode="after")
     def _validate(self) -> "WindowRequest":
@@ -69,6 +116,14 @@ class WindowRequest(BaseModel):
         ):
             if value != value or value in (float("inf"), float("-inf")):
                 raise ValueError(f"{name} 必须为有限数值")
+        if self.transit_duration_seconds is not None:
+            v = self.transit_duration_seconds
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError("transit_duration_seconds 必须为有限数值")
+        if self.maintenance_blocks and self.transit_duration_seconds is None:
+            raise ValueError(
+                "maintenance_blocks 需配合 transit_duration_seconds 一起使用"
+            )
         for i, s in enumerate(self.samples):
             if s.height_m != s.height_m:
                 raise ValueError(f"samples[{i}].height_m 不能为 NaN")
@@ -91,11 +146,18 @@ class UnknownOut(BaseModel):
     duration_seconds: float
 
 
+class DepartureWindowOut(BaseModel):
+    start: UtcZ
+    end: UtcZ
+    duration_seconds: int
+
+
 class ResultOut(BaseModel):
     threshold_m: float
     max_gap_seconds: float
     windows: list[WindowOut]
     unknown: list[UnknownOut]
+    departure_windows: list[DepartureWindowOut] | None = None
 
 
 class TaskOut(BaseModel):

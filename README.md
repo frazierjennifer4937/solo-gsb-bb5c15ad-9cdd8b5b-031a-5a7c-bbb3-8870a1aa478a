@@ -5,6 +5,11 @@
 求根并**保守取整到秒**。相邻样本间隔超过 `max_gap_seconds` 的区段**禁止插值**，
 作为 `unknown` 返回，通航窗口不会跨越该区段。
 
+可选的**航程占用约束**：创建任务时传入 `transit_duration_seconds`（航程占用秒数）
+与 `maintenance_blocks`（维护封航区间，UTC 起止）后，结果额外包含
+`departure_windows` —— 仅保留**从出发到结束全程落在同一安全通航窗口**、且不与任何
+维护封航区间相交的出发时段（占用区间按 `[出发时刻, 出发时刻+航程)` 处理）。
+
 计算以**异步任务**方式执行：先创建任务拿到 ID，再按 ID 轮询结果；任务状态与
 结果持久化在 SQLite 中（容器启动时自动建库建表）。
 
@@ -61,9 +66,13 @@ TIDE_DB_PATH=./data/tide.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `draft_m` | number ≥ 0 | 船舶吃水（米） |
 | `clearance_m` | number ≥ 0 | 船底最小富余水深（米） |
 | `max_gap_seconds` | number > 0 | 相邻样本最大允许间隔（秒），超过则该区段禁止插值 |
+| `transit_duration_seconds` | number > 0，可选 | 航程占用时长（秒）；提供后结果附带 `departure_windows` |
+| `maintenance_blocks` | 数组，可选 | 维护封航区间 `[{"start", "end"}]`（UTC 起止）；需配合 `transit_duration_seconds` 使用，计算前会裁剪到查询范围并合并重叠/首尾相接的区间 |
 
 > 潮高、吃水、富余必须使用**同一垂直基准面**，单位统一为米。
 > 安全水深阈值 = `draft_m + clearance_m`。
+> 不传 `transit_duration_seconds` / `maintenance_blocks` 时，行为与之前完全一致
+> （`departure_windows` 为 `null`）。
 
 ```bash
 curl -X POST http://localhost:8000/tasks \
@@ -83,7 +92,11 @@ curl -X POST http://localhost:8000/tasks \
     "query_end":   "2026-09-21T07:00:00Z",
     "draft_m": 4.0,
     "clearance_m": 1.0,
-    "max_gap_seconds": 3700
+    "max_gap_seconds": 3700,
+    "transit_duration_seconds": 1800,
+    "maintenance_blocks": [
+      {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+    ]
   }'
 ```
 
@@ -109,33 +122,63 @@ curl -X POST http://localhost:8000/tasks \
 | `sample_gap_exceeds_max_gap` | 相邻样本间隔超过 `max_gap_seconds`，按要求禁止插值 |
 | `no_sample_coverage` | 查询范围超出全部样本覆盖区间（不做外推） |
 
-示例响应（节选）：
+`result.departure_windows[]`（仅当请求提供 `transit_duration_seconds` 时返回，否则为 `null`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `start` / `end` | 可出发时段起止（整秒、UTC `Z` 结尾）：在该时段内任意时刻 `t` 出发，占用区间 `[t, t+航程)` 全程落在**同一**安全通航窗口内，且不与任何维护封航区间或 `unknown` 区段相交 |
+| `duration_seconds` | 可出发时段时长（秒） |
+
+> 边界规则：占用区间为半开区间 `[t, t+航程)`，因此在封航开始时刻减去航程的
+> 整点、或封航结束时刻整点出发是**允许**的（占用区间与封航区间仅端点相接、
+> 不相交）。封航区间先裁剪到查询范围、合并重叠或首尾相接的区间后，再整体
+> 向前平移航程时长，从各安全窗口的候选出发区间中扣除。
+
+示例响应（上面请求的真实结果，节选）：
 
 ```json
 {
-  "task_id": "002458c031004733a6172a2d9add2027",
+  "task_id": "51341849cf6c44cc96b48dc19fb0f4f0",
   "status": "done",
-  "created_at": "2026-09-21T05:16:13.811445Z",
+  "created_at": "2026-09-21T13:50:03.600093Z",
   "result": {
-    "threshold_m": 4.5,
+    "threshold_m": 5.0,
     "max_gap_seconds": 3700.0,
     "windows": [
       {
-        "start": "2026-09-21T01:33:22Z",
-        "end": "2026-09-21T04:26:38Z",
-        "start_height_m": 4.5,
-        "end_height_m": 4.5,
-        "min_height_m": 4.5,
-        "duration_seconds": 10396
+        "start": "2026-09-21T01:39:11Z",
+        "end": "2026-09-21T05:20:49Z",
+        "start_height_m": 5.001,
+        "end_height_m": 5.001,
+        "min_height_m": 5.001,
+        "duration_seconds": 13298
       }
     ],
-    "unknown": []
+    "unknown": [],
+    "departure_windows": [
+      {
+        "start": "2026-09-21T01:39:11Z",
+        "end": "2026-09-21T02:30:00Z",
+        "duration_seconds": 3049
+      },
+      {
+        "start": "2026-09-21T04:00:00Z",
+        "end": "2026-09-21T04:50:49Z",
+        "duration_seconds": 3049
+      }
+    ]
   },
   "error": null
 }
 ```
 
-校验失败（如样本未严格递增、吃水为负等）统一返回 `422` 并指明字段与原因。
+其中安全窗口为 01:39:11–05:20:49；封航 03:00–04:00 向前平移 30 分钟航程后
+扣除出发区间 (02:30, 04:00)，故可出发时段被切成两段（02:30 与 04:00 整点
+出发均允许），且每段最晚出发时刻都比窗口结束早 30 分钟。
+
+校验失败（如样本未严格递增、吃水为负、封航区间 end 不晚于 start、只传
+`maintenance_blocks` 而未传 `transit_duration_seconds` 等）统一返回 `422`
+并指明字段与原因。
 
 ## 算法说明
 
@@ -154,6 +197,11 @@ curl -X POST http://localhost:8000/tasks \
 6. **unknown 互补集**：查询区间内未被任何有效链覆盖的部分即为 `unknown`，
    并区分“超间隔（禁止插值）”与“无样本覆盖（不外推）”两种原因；
    窗口严格落在覆盖区内，绝不跨越未知段。
+7. **出发窗口（可选）**：提供 `transit_duration_seconds` 时，在每个安全窗口
+   `[ws, we]` 内取候选出发区间 `[ws, we - 航程]`（保证占用区间
+   `[t, t+航程)` 全程落在同一窗口内）；维护封航区间裁剪到查询范围、合并
+   重叠/首尾相接区间后，与 `unknown` 区段一并向前平移航程时长，从候选区间
+   中扣除（扣除区间为开区间，端点时刻出发仍允许），最后同样保守取整到秒。
 
 ## 项目结构与测试
 

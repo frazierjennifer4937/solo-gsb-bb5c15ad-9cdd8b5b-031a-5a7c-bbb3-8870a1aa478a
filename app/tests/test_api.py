@@ -1,5 +1,6 @@
 import os
 import tempfile
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -88,3 +89,59 @@ def test_gap_returns_unknown(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def _parse(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def test_departure_windows_end_to_end(client):
+    payload = _payload()
+    payload["transit_duration_seconds"] = 1800
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+    ]
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 201, resp.text
+    result = client.get(f"/tasks/{resp.json()['task_id']}").json()["result"]
+
+    assert len(result["windows"]) == 1
+    w = result["windows"][0]
+    deps = result["departure_windows"]
+    assert deps is not None and len(deps) == 2
+    # Closure [03:00, 04:00) shifted back by the 30 min transit bars
+    # departures in (02:30, 04:00); the cut points remain departable.
+    assert deps[0]["start"] == w["start"]
+    assert deps[0]["end"] == "2026-09-21T02:30:00Z"
+    assert deps[1]["start"] == "2026-09-21T04:00:00Z"
+    # Every departure's occupancy [t, t+1800) fits inside the safe window.
+    assert _parse(deps[1]["end"]) == _parse(w["end"]) - timedelta(seconds=1800)
+    assert deps[0]["duration_seconds"] == int(
+        (_parse(deps[0]["end"]) - _parse(deps[0]["start"])).total_seconds()
+    )
+
+
+def test_departure_windows_omitted_by_default(client):
+    resp = client.post("/tasks", json=_payload())
+    assert resp.status_code == 201, resp.text
+    result = client.get(f"/tasks/{resp.json()['task_id']}").json()["result"]
+    assert result["departure_windows"] is None
+
+
+def test_maintenance_requires_transit_duration(client):
+    payload = _payload()
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+    ]
+    resp = client.post("/tasks", json=payload)
+    assert resp.status_code == 422
+    assert "transit_duration_seconds" in resp.text
+
+
+def test_maintenance_block_end_after_start(client):
+    payload = _payload()
+    payload["transit_duration_seconds"] = 1800
+    payload["maintenance_blocks"] = [
+        {"start": "2026-09-21T04:00:00Z", "end": "2026-09-21T03:00:00Z"}
+    ]
+    assert client.post("/tasks", json=payload).status_code == 422

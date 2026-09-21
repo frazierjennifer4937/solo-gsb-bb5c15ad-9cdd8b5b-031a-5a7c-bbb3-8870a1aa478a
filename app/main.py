@@ -35,12 +35,23 @@ def _run_task(task_id: str, req: WindowRequest) -> None:
                 draft_m=req.draft_m,
                 clearance_m=req.clearance_m,
                 max_gap_seconds=req.max_gap_seconds,
+                transit_duration_seconds=req.transit_duration_seconds,
+                maintenance_blocks=(
+                    [(b.start, b.end) for b in req.maintenance_blocks]
+                    if req.maintenance_blocks
+                    else None
+                ),
             )
             result_out = ResultOut(
                 threshold_m=result.threshold_m,
                 max_gap_seconds=result.max_gap_seconds,
                 windows=[vars(w) for w in result.windows],
                 unknown=[vars(u) for u in result.unknown],
+                departure_windows=(
+                    [vars(d) for d in result.departure_windows]
+                    if result.departure_windows is not None
+                    else None
+                ),
             )
             conn.execute(
                 "UPDATE tasks SET status = 'done', result = ? WHERE task_id = ?",
@@ -66,7 +77,7 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 app = FastAPI(
     title=settings.api_title,
     version="1.0.0",
-    description="基于 PCHIP 插值的潮位安全通航窗口计算（FastAPI + SciPy + SQLite）",
+    description="基于 PCHIP 插值的潮位安全通航窗口与出发窗口计算（FastAPI + SciPy + SQLite）",
     lifespan=lifespan,
 )
 

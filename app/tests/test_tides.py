@@ -1,11 +1,31 @@
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.services.tides import compute_navigation_windows
 
 
 def dt(hours: float) -> datetime:
     return datetime.fromtimestamp(hours * 3600, tz=timezone.utc)
+
+
+TRIANGLE_HEIGHTS = [0, 2, 4, 6, 8, 10, 8, 6, 4, 2, 0, 2, 4]
+
+
+def _triangle(transit=None, maintenance=None):
+    # Heights 0..12 h: rise to 10 m, fall to 0, then slight rise below
+    # threshold. Safety threshold = draft 4 + clearance 1 = 5 m; the single
+    # safe window is exactly [02:30, 07:30].
+    return compute_navigation_windows(
+        sample_times=[dt(h) for h in range(13)],
+        sample_heights=TRIANGLE_HEIGHTS,
+        query_start=dt(0),
+        query_end=dt(12),
+        draft_m=4.0,
+        clearance_m=1.0,
+        max_gap_seconds=4000,
+        transit_duration_seconds=transit,
+        maintenance_blocks=maintenance,
+    )
 
 
 def test_linear_triangle_windows():
@@ -118,3 +138,87 @@ def test_crossing_rounded_to_seconds():
         t0.timestamp() + 101, tz=timezone.utc
     )
     assert res.windows[0].end == times[1]
+
+
+def test_departure_windows_absent_without_transit():
+    res = _triangle()
+    assert res.departure_windows is None
+
+
+def test_departure_windows_basic():
+    res = _triangle(transit=3600)
+    assert res.departure_windows is not None
+    assert len(res.windows) == 1
+    assert len(res.departure_windows) == 1
+    w = res.windows[0]
+    dep = res.departure_windows[0]
+    # The whole occupancy [t, t+3600) must fit in the safe window:
+    # departures run from the window start to window end minus the transit.
+    assert dep.start == w.start == dt(2.5)
+    assert dep.end == w.end - timedelta(hours=1) == dt(6.5)
+    assert dep.duration_seconds == 18000 - 3600
+
+
+def test_departure_windows_window_shorter_than_transit():
+    res = _triangle(transit=6 * 3600)  # safe window lasts only 5 h
+    assert res.departure_windows == []
+
+
+def test_departure_windows_maintenance_shift_and_boundaries():
+    res = _triangle(transit=3600, maintenance=[(dt(4), dt(5))])
+    # Closure [04:00, 05:00) bars departures in (03:00, 05:00): a departure
+    # at exactly 03:00 occupies [03:00, 04:00) and only touches the closure,
+    # and one at exactly 05:00 starts as the closure ends — both allowed.
+    deps = res.departure_windows
+    assert [(d.start, d.end) for d in deps] == [
+        (dt(2.5), dt(3)),
+        (dt(5), dt(6.5)),
+    ]
+
+
+def test_departure_windows_merge_touching_and_overlapping_blocks():
+    # Touching blocks merge into [03:00, 05:00) before the shift.
+    res = _triangle(transit=3600, maintenance=[(dt(3), dt(4)), (dt(4), dt(5))])
+    assert [(d.start, d.end) for d in res.departure_windows] == [
+        (dt(5), dt(6.5)),
+    ]
+    # Overlapping blocks merge the same way.
+    res = _triangle(transit=3600, maintenance=[(dt(3), dt(4.5)), (dt(4), dt(5))])
+    assert [(d.start, d.end) for d in res.departure_windows] == [
+        (dt(5), dt(6.5)),
+    ]
+
+
+def test_departure_windows_blocks_clipped_to_query_range():
+    # Blocks entirely outside the query range are clipped away.
+    res = _triangle(transit=3600, maintenance=[(dt(20), dt(21))])
+    assert len(res.departure_windows) == 1
+    assert res.departure_windows[0].start == dt(2.5)
+    assert res.departure_windows[0].end == dt(6.5)
+    # A block straddling the query end is clipped, then shifted.
+    res = _triangle(transit=3600, maintenance=[(dt(7), dt(20))])
+    assert [(d.start, d.end) for d in res.departure_windows] == [
+        (dt(2.5), dt(6)),
+    ]
+
+
+def test_departure_windows_never_cross_unknown():
+    # Two safe plateaus separated by a forbidden gap: each plateau yields its
+    # own departure window, none spans the unknown stretch.
+    res = compute_navigation_windows(
+        sample_times=[dt(h) for h in (0, 1, 2, 5, 6, 7)],
+        sample_heights=[8, 9, 8, 8, 9, 8],
+        query_start=dt(0),
+        query_end=dt(7),
+        draft_m=5.0,
+        clearance_m=0.0,
+        max_gap_seconds=3600 + 60,
+        transit_duration_seconds=3600,
+    )
+    assert len(res.windows) == 2
+    assert [(d.start, d.end) for d in res.departure_windows] == [
+        (dt(0), dt(1)),
+        (dt(5), dt(6)),
+    ]
+    for dep in res.departure_windows:
+        assert dep.end + timedelta(hours=1) <= dt(2) or dep.start >= dt(5)

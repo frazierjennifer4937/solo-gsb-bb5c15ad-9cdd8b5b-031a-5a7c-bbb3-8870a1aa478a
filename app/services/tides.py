@@ -15,11 +15,18 @@ Sample pairs whose spacing exceeds ``max_gap_seconds`` are never bridged:
 they split the samples into independent chains, and the affected parts of
 the query range are returned as ``unknown`` intervals.  Windows never cross
 those gaps.
+
+Optionally, when a transit duration is supplied, departure windows are
+derived on top of the safe windows: a departure at ``t`` occupies
+``[t, t + duration)`` and is only reported when the whole occupancy stays
+inside ONE safe window and clears every maintenance closure and every
+``unknown`` stretch.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
@@ -55,11 +62,22 @@ class UnknownInterval:
 
 
 @dataclass(frozen=True)
+class DepartureWindow:
+    """Departure interval whose whole transit fits inside one safe window."""
+
+    start: datetime
+    end: datetime
+    duration_seconds: int
+
+
+@dataclass(frozen=True)
 class NavigationResult:
     threshold_m: float
     max_gap_seconds: float
     windows: list[Window]
     unknown: list[UnknownInterval]
+    # Only computed when a transit duration is supplied; None otherwise.
+    departure_windows: list[DepartureWindow] | None = None
 
 
 def to_epoch(t: datetime) -> float:
@@ -239,6 +257,95 @@ def _classify_unknown(
                         "no_sample_coverage")
 
 
+def _merge_intervals(
+    intervals: Iterable[tuple[float, float]], lo: float, hi: float
+) -> list[tuple[float, float]]:
+    """Clip [start, end) intervals to [lo, hi] and merge overlaps/touches."""
+    clipped = sorted(
+        (max(s, lo), min(e, hi))
+        for s, e in intervals
+        if min(e, hi) > max(s, lo)
+    )
+    merged: list[list[float]] = []
+    for s, e in clipped:
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def compute_departure_windows(
+    windows: Sequence[Window],
+    unknown: Sequence[UnknownInterval],
+    query_start: datetime,
+    query_end: datetime,
+    transit_duration_seconds: float,
+    maintenance_blocks: Sequence[tuple[datetime, datetime]] | None = None,
+) -> list[DepartureWindow]:
+    """Derive departure windows from the safe windows.
+
+    A departure at ``t`` occupies ``[t, t + transit_duration_seconds)``; the
+    occupancy must lie entirely within ONE safe window and must not intersect
+    any maintenance closure or ``unknown`` stretch.  Closures are clipped to
+    the query range and merged (overlapping or touching) together with the
+    unknown intervals; each merged closure ``[s, e)`` then bars exactly the
+    departures in the open interval ``(s - d, e)`` — equivalently, the
+    closure is shifted earlier by the transit duration ``d`` and subtracted
+    from the candidate departure intervals.  Because the occupancy is
+    half-open, a departure exactly at ``s - d`` or ``e`` is still allowed.
+    """
+    d = float(transit_duration_seconds)
+    qs = to_epoch(query_start)
+    qe = to_epoch(query_end)
+
+    sources: list[tuple[float, float]] = [
+        (to_epoch(u.start), to_epoch(u.end)) for u in unknown
+    ]
+    if maintenance_blocks:
+        sources.extend((to_epoch(s), to_epoch(e)) for s, e in maintenance_blocks)
+    merged = _merge_intervals(sources, qs, qe)
+    blocked = [(s - d, e) for s, e in merged]
+
+    out: list[DepartureWindow] = []
+    for w in windows:
+        lo = to_epoch(w.start)
+        hi = to_epoch(w.end) - d  # occupancy [t, t+d) must end by the window end
+        if hi < lo:
+            continue  # window shorter than the transit: no safe departure
+        # Subtract the open blocked intervals from the closed candidate
+        # interval [lo, hi]; the cut points themselves remain departable.
+        pieces = [(lo, hi)]
+        for bs, be in blocked:
+            remaining: list[tuple[float, float]] = []
+            for a, b in pieces:
+                if be <= a or bs >= b:
+                    remaining.append((a, b))
+                    continue
+                if a <= bs:
+                    remaining.append((a, min(bs, b)))
+                if be <= b:
+                    remaining.append((max(be, a), b))
+            pieces = remaining
+            if not pieces:
+                break
+        for a, b in pieces:
+            # Conservative rounding to whole seconds, as for the windows.
+            a2 = float(math.ceil(a))
+            b2 = float(math.floor(b))
+            if a2 > b2:
+                continue
+            out.append(
+                DepartureWindow(
+                    start=to_datetime(a2),
+                    end=to_datetime(b2),
+                    duration_seconds=int(b2 - a2),
+                )
+            )
+    return out
+
+
 def compute_navigation_windows(
     sample_times: Sequence[datetime],
     sample_heights: Sequence[float],
@@ -247,11 +354,15 @@ def compute_navigation_windows(
     draft_m: float,
     clearance_m: float,
     max_gap_seconds: float,
+    transit_duration_seconds: float | None = None,
+    maintenance_blocks: Sequence[tuple[datetime, datetime]] | None = None,
 ) -> NavigationResult:
     """Compute all continuous safe navigation windows in the query range.
 
     ``draft_m + clearance_m`` is the safety threshold (same vertical datum
-    and metres as the tide heights).
+    and metres as the tide heights).  When ``transit_duration_seconds`` is
+    given, departure windows are additionally derived from the safe windows
+    (see :func:`compute_departure_windows`).
     """
     threshold = draft_m + clearance_m
     qs = to_epoch(query_start)
@@ -308,9 +419,21 @@ def compute_navigation_windows(
     if cursor < qe:
         _classify_unknown(unknown, cursor, qe, first_time, last_time)
 
+    departure_windows: list[DepartureWindow] | None = None
+    if transit_duration_seconds is not None:
+        departure_windows = compute_departure_windows(
+            windows=windows,
+            unknown=unknown,
+            query_start=query_start,
+            query_end=query_end,
+            transit_duration_seconds=transit_duration_seconds,
+            maintenance_blocks=maintenance_blocks,
+        )
+
     return NavigationResult(
         threshold_m=threshold,
         max_gap_seconds=float(max_gap_seconds),
         windows=windows,
         unknown=unknown,
+        departure_windows=departure_windows,
     )
